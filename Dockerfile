@@ -1,7 +1,7 @@
-FROM jboss/keycloak:latest
+FROM quay.io/keycloak/keycloak:latest
 
-COPY docker-entrypoint.sh /opt/jboss/tools
+COPY docker-entrypoint.sh /opt/quay.io/tools
 
-ENTRYPOINT [ "/opt/jboss/tools/docker-entrypoint.sh" ]
+ENTRYPOINT [ "/opt/quay.io/tools/docker-entrypoint.sh" ]
 CMD ["-b", "0.0.0.0"]
 
