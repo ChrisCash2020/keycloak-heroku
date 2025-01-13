@@ -1,192 +1,111 @@
 #!/bin/bash
-
-# Set database config from Heroku DATABASE_URL
-if [ "$DATABASE_URL" != "" ]; then
-    echo "Found database configuration in DATABASE_URL=$DATABASE_URL"
-
-    regex='^postgres://([a-zA-Z0-9_-]+):([a-zA-Z0-9]+)@([a-z0-9.-]+):([[:digit:]]+)/([a-zA-Z0-9_-]+)$'
-    if [[ $DATABASE_URL =~ $regex ]]; then
-        export DB_ADDR=${BASH_REMATCH[3]}
-        export DB_PORT=${BASH_REMATCH[4]}
-        export DB_DATABASE=${BASH_REMATCH[5]}
-        export DB_USER=${BASH_REMATCH[1]}
-        export DB_PASSWORD=${BASH_REMATCH[2]}
-
-        echo "DB_ADDR=$DB_ADDR, DB_PORT=$DB_PORT, DB_DATABASE=$DB_DATABASE, DB_USER=$DB_USER, DB_PASSWORD=$DB_PASSWORD"
-        export DB_VENDOR=postgres
-    fi
-
-fi
+set -eou pipefail
 
 # usage: file_env VAR [DEFAULT]
 #    ie: file_env 'XYZ_DB_PASSWORD' 'example'
 # (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
 #  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
 file_env() {
-	local var="$1"
-	local fileVar="${var}_FILE"
-	local def="${2:-}"
-	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
-		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
-		exit 1
-	fi
-	local val="$def"
-	if [ "${!var:-}" ]; then
-		val="${!var}"
-	elif [ "${!fileVar:-}" ]; then
-		val="$(< "${!fileVar}")"
-	fi
-	export "$var"="$val"
-	unset "$fileVar"
+  local var="$1"
+  local CONFIG_MARKER_FILE="${var}_FILE"
+  local def="${2:-}"
+  if [[ ${!var:-} && ${!CONFIG_MARKER_FILE:-} ]]; then
+    echo >&2 "error: both $var and $CONFIG_MARKER_FILE are set (but are exclusive)"
+    exit 1
+  fi
+  local val="$def"
+  if [[ ${!var:-} ]]; then
+    val="${!var}"
+  elif [[ ${!CONFIG_MARKER_FILE:-} ]]; then
+    val="$(<"${!CONFIG_MARKER_FILE}")"
+  fi
+
+  if [[ -n $val ]]; then
+    export "$var"="$val"
+  fi
+
+  unset "$CONFIG_MARKER_FILE"
 }
 
-##################
-# Add admin user #
-##################
+##############################
+# Set admin user credentials #
+##############################
 
-file_env 'KEYCLOAK_USER'
-file_env 'KEYCLOAK_PASSWORD'
+file_env 'KEYCLOAK_ADMIN'
+file_env 'KEYCLOAK_ADMIN_PASSWORD'
 
-if [ $KEYCLOAK_USER ] && [ $KEYCLOAK_PASSWORD ]; then
-    /opt/jboss/keycloak/bin/add-user-keycloak.sh --user $KEYCLOAK_USER --password $KEYCLOAK_PASSWORD
+################################################
+# Set database config from Heroku DATABASE_URL #
+################################################
+if [ "$DATABASE_URL" != "" ]; then
+  echo "Found database configuration in DATABASE_URL=$DATABASE_URL"
+
+  regex='^mysql://([a-zA-Z0-9_-]+):([a-zA-Z0-9]+)@([a-z0-9.-]+):([[:digit:]]+)/([a-zA-Z0-9_-]+)$'
+  if [[ $DATABASE_URL =~ $regex ]]; then
+    DB_ADDR=${BASH_REMATCH[3]}
+    DB_PORT=${BASH_REMATCH[4]}
+    DB_DATABASE=${BASH_REMATCH[5]}
+    DB_USER=${BASH_REMATCH[1]}
+    DB_PASSWORD=${BASH_REMATCH[2]}
+
+    echo "DB_ADDR=$DB_ADDR, DB_PORT=$DB_PORT, DB_DATABASE=$DB_DATABASE, DB_USER=$DB_USER, DB_PASSWORD=$DB_PASSWORD"
+
+    export DB_ARGS="-Dkc.db.url.host=$DB_ADDR -Dkc.db.url.database=$DB_DATABASE --db-username=$DB_USER --db-password=$DB_PASSWORD"
+  fi
 fi
-
-############
-# Hostname #
-############
-
-if [ "$KEYCLOAK_HOSTNAME" != "" ]; then
-    SYS_PROPS="-Dkeycloak.hostname.provider=fixed -Dkeycloak.hostname.fixed.hostname=$KEYCLOAK_HOSTNAME"
-
-    if [ "$KEYCLOAK_HTTP_PORT" != "" ]; then
-        SYS_PROPS+=" -Dkeycloak.hostname.fixed.httpPort=$KEYCLOAK_HTTP_PORT"
-    fi
-
-    if [ "$KEYCLOAK_HTTPS_PORT" != "" ]; then
-        SYS_PROPS+=" -Dkeycloak.hostname.fixed.httpsPort=$KEYCLOAK_HTTPS_PORT"
-    fi
-fi
-
-################
-# Realm import #
-################
-
-if [ "$KEYCLOAK_IMPORT" ]; then
-    SYS_PROPS+=" -Dkeycloak.import=$KEYCLOAK_IMPORT"
-fi
-
-########################
-# JGroups bind options #
-########################
-
-if [ -z "$BIND" ]; then
-    BIND=$(hostname -i)
-fi
-if [ -z "$BIND_OPTS" ]; then
-    for BIND_IP in $BIND
-    do
-        BIND_OPTS+=" -Djboss.bind.address=$BIND_IP -Djboss.bind.address.private=$BIND_IP "
-    done
-fi
-SYS_PROPS+=" $BIND_OPTS"
-
-#################
-# Configuration #
-#################
-
-# If the server configuration parameter is not present, append the HA profile.
-if echo "$@" | egrep -v -- '-c |-c=|--server-config |--server-config='; then
-    SYS_PROPS+=" -c=standalone-ha.xml"
-fi
-
-############
-# DB setup #
-############
-
-file_env 'DB_USER'
-file_env 'DB_PASSWORD'
-
-# Lower case DB_VENDOR
-DB_VENDOR=`echo $DB_VENDOR | tr A-Z a-z`
-
-# Detect DB vendor from default host names
-if [ "$DB_VENDOR" == "" ]; then
-    if (getent hosts postgres &>/dev/null); then
-        export DB_VENDOR="postgres"
-    elif (getent hosts mysql &>/dev/null); then
-        export DB_VENDOR="mysql"
-    elif (getent hosts mariadb &>/dev/null); then
-        export DB_VENDOR="mariadb"
-    fi
-fi
-
-# Detect DB vendor from legacy `*_ADDR` environment variables
-if [ "$DB_VENDOR" == "" ]; then
-    if (printenv | grep '^POSTGRES_ADDR=' &>/dev/null); then
-        export DB_VENDOR="postgres"
-    elif (printenv | grep '^MYSQL_ADDR=' &>/dev/null); then
-        export DB_VENDOR="mysql"
-    elif (printenv | grep '^MARIADB_ADDR=' &>/dev/null); then
-        export DB_VENDOR="mariadb"
-    fi
-fi
-
-# Default to H2 if DB type not detected
-if [ "$DB_VENDOR" == "" ]; then
-    export DB_VENDOR="h2"
-fi
-
-# Set DB name
-case "$DB_VENDOR" in
-    postgres)
-        DB_NAME="PostgreSQL";;
-    mysql)
-        DB_NAME="MySQL";;
-    mariadb)
-        DB_NAME="MariaDB";;
-    h2)
-        DB_NAME="Embedded H2";;
-    *)
-        echo "Unknown DB vendor $DB_VENDOR"
-        exit 1
-esac
-
-# Append '?' in the beggining of the string if JDBC_PARAMS value isn't empty
-export JDBC_PARAMS=$(echo ${JDBC_PARAMS} | sed '/^$/! s/^/?/')
-
-# Convert deprecated DB specific variables
-function set_legacy_vars() {
-  local suffixes=(ADDR DATABASE USER PASSWORD PORT)
-  for suffix in "${suffixes[@]}"; do
-    local varname="$1_$suffix"
-    if [ ${!varname} ]; then
-      echo WARNING: $varname variable name is DEPRECATED replace with DB_$suffix
-      export DB_$suffix=${!varname}
-    fi
-  done
-}
-set_legacy_vars `echo $DB_VENDOR | tr a-z A-Z`
-
-# Configure DB
-
-echo "========================================================================="
-echo ""
-echo "  Using $DB_NAME database"
-echo ""
-echo "========================================================================="
-echo ""
-
-if [ "$DB_VENDOR" != "h2" ]; then
-    /bin/sh /opt/jboss/tools/databases/change-database.sh $DB_VENDOR
-fi
-
-/opt/jboss/tools/x509.sh
-/opt/jboss/tools/jgroups.sh $JGROUPS_DISCOVERY_PROTOCOL $JGROUPS_DISCOVERY_PROPERTIES
-/opt/jboss/tools/autorun.sh
 
 ##################
 # Start Keycloak #
 ##################
 
-exec /opt/jboss/keycloak/bin/standalone.sh $SYS_PROPS $@ -Djboss.http.port=$PORT 
+CONFIG_ARGS=""
+RUN_CONFIG_START=false
+RUN_CONFIG=false
+SERVER_OPTS="--http-port=$PORT --proxy=edge --cluster=local"
+
+if [ "$DB_ARGS" != "" ]; then
+  SERVER_OPTS="$SERVER_OPTS $DB_ARGS"
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --auto-config)
+    RUN_CONFIG_START=true
+    ;;
+  config)
+    RUN_CONFIG=true
+    ;;
+  /opt/jboss/tools/docker-entrypoint.sh)
+    echo "Ignoring redundant entrypoint argument"
+    ;;
+  *)
+    if [[ $1 == --* || ! $1 =~ ^-.* ]]; then
+      CONFIG_ARGS="$CONFIG_ARGS $1"
+    else
+      SERVER_OPTS="$SERVER_OPTS $1"
+    fi
+    ;;
+  esac
+  shift
+done
+
+if [[ "$RUN_CONFIG_START" == true ]]; then
+  if [[ "$RUN_CONFIG" == true ]]; then
+    echo "ERROR: You can not run 'config' when passing the '--auto-config' start option.Please, choose one or another."
+    exit 2
+  fi
+
+  CONFIG_MARKER_FILE="/opt/jboss/keycloak/config_marker"
+
+  if [[ -n $CONFIG_ARGS && ! -f "$CONFIG_MARKER_FILE" ]]; then
+    exec /opt/jboss/keycloak/bin/kc.sh config $CONFIG_ARGS &
+    wait $!
+    touch $CONFIG_MARKER_FILE
+  fi
+
+  exec /opt/jboss/keycloak/bin/kc.sh $SERVER_OPTS
+else
+  exec /opt/jboss/keycloak/bin/kc.sh $SERVER_OPTS $CONFIG_ARGS
+fi
+
 exit $?
