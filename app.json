@@ -34,7 +34,7 @@
     },
     "addons": [
         {
-            "plan": "heroku-postgresql:hobby-dev"
+            "plan": "jawsdb:kitefin"
         }
     ]
 }
